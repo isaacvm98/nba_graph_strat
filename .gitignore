@@ -1,6 +1,5 @@
 
 .venv/
-data/secrets/
 __pycache__/
 *.pyc
 .env
