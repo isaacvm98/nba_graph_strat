@@ -85,30 +85,38 @@ def build_lineup_network(
     season: str,
     team_abbr: str,
     conn: sqlite3.Connection | None = None,
-    share_threshold: int = SHARE_THRESHOLD,
+    share_threshold: int | None = None,
     min_minutes: float = 0.0,
+    group_quantity: int = 5,
 ) -> nx.Graph:
-    """Shared-player network of 5-man lineups for one team-season.
+    """Shared-player network of N-man lineups for one team-season.
 
-    Nodes are 5-man lineups (keyed by GROUP_ID). Edge between two lineups iff
-    they share at least `share_threshold` players; edge weight = #shared players.
-    Each node carries playing time (MIN) and games played (GP).
+    Nodes are N-man lineups (keyed by GROUP_ID, where N=`group_quantity`).
+    Edge between two lineups iff they share at least `share_threshold` players;
+    edge weight = #shared players. Each node carries playing time (MIN) and
+    games played (GP).
+
+    `share_threshold` defaults to `max(1, group_quantity - 2)` — i.e. 1 for
+    2-man, 1 for 3-man, 3 for 5-man (the original SHARE_THRESHOLD). Caller
+    can override.
     """
+    if share_threshold is None:
+        share_threshold = max(1, group_quantity - 2)
     own_conn = conn is None
     conn = conn or _conn()
     try:
         df = pd.read_sql_query(
             "SELECT GROUP_ID, GROUP_NAME, MIN, GP "
             "FROM lineup_stats_base "
-            "WHERE SEASON=? AND TEAM_ABBREVIATION=? AND MIN>=?",
+            "WHERE SEASON=? AND TEAM_ABBREVIATION=? AND MIN>=? AND GROUP_QUANTITY=?",
             conn,
-            params=(season, team_abbr, min_minutes),
+            params=(season, team_abbr, min_minutes, group_quantity),
         )
     finally:
         if own_conn:
             conn.close()
 
-    g = nx.Graph(season=season, team=team_abbr, layer="lineup")
+    g = nx.Graph(season=season, team=team_abbr, layer="lineup", group_quantity=group_quantity)
     if df.empty:
         return g
 
@@ -132,6 +140,61 @@ def build_lineup_network(
             shared = pi.intersection(pj)
             if len(shared) >= share_threshold:
                 g.add_edge(rows[i]["GROUP_ID"], rows[j]["GROUP_ID"], weight=len(shared))
+    return g
+
+
+def build_player_cooccurrence_network(
+    season: str,
+    team_abbr: str,
+    conn: sqlite3.Connection | None = None,
+    min_minutes: float = 0.0,
+    group_quantity: int = 2,
+) -> nx.Graph:
+    """Player-level co-occurrence graph derived from N-man lineups.
+
+    Nodes are *players*; edge weight between two players = total minutes they
+    appear together in any N-man unit (default N=2, so weight = joint minutes
+    directly). For N=3 the same pair appears across 3-man combos — we sum.
+    Cleaner than the lineup-level graph for player-chemistry analysis.
+    """
+    own_conn = conn is None
+    conn = conn or _conn()
+    try:
+        df = pd.read_sql_query(
+            "SELECT GROUP_ID, GROUP_NAME, MIN "
+            "FROM lineup_stats_base "
+            "WHERE SEASON=? AND TEAM_ABBREVIATION=? AND MIN>=? AND GROUP_QUANTITY=?",
+            conn,
+            params=(season, team_abbr, min_minutes, group_quantity),
+        )
+    finally:
+        if own_conn:
+            conn.close()
+
+    g = nx.Graph(season=season, team=team_abbr, layer="player_cooccurrence",
+                 group_quantity=group_quantity)
+    if df.empty:
+        return g
+
+    from itertools import combinations
+
+    # Map player_id -> last-seen name (parsed from GROUP_NAME if present).
+    names: dict[int, str] = {}
+    for _, r in df.iterrows():
+        pids = _parse_lineup_player_ids(r["GROUP_ID"])
+        # GROUP_NAME is " - "-joined player names in the same order as GROUP_ID.
+        parts = [p.strip() for p in (r["GROUP_NAME"] or "").split(" - ")] if r["GROUP_NAME"] else []
+        for pid, nm in zip(pids, parts):
+            names.setdefault(pid, nm)
+        minutes = float(r["MIN"] or 0)
+        for a, b in combinations(sorted(pids), 2):
+            if g.has_edge(a, b):
+                g[a][b]["weight"] += minutes
+            else:
+                g.add_edge(a, b, weight=minutes)
+
+    for nd in g.nodes:
+        g.nodes[nd]["name"] = names.get(nd, str(nd))
     return g
 
 

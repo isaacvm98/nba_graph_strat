@@ -5,3 +5,5 @@ __pycache__/
 .env
 .claude
 data/
+meeting_logs/*
+!meeting_logs/2026-05-12_kickoff.md
